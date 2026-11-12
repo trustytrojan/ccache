@@ -2056,22 +2056,26 @@ hash_native_args(Context& ctx, const util::Args& native_args, Hash& hash)
   return {};
 }
 
-static std::tuple<std::optional<std::string_view>, std::optional<std::string>>
+// Options forwarded by clang-cl's /clang:<arg> have the prefix "-clang:" on
+// the processed command line, including separate values.
+static std::string_view
+without_clang_cl_prefix(std::string_view arg)
+{
+  if (arg.starts_with("-clang:")) {
+    arg.remove_prefix(7);
+  }
+  return arg;
+}
+
+static std::tuple<std::optional<std::string_view>,
+                  std::optional<std::string_view>>
 get_option_and_value(std::string_view option, const util::Args& args, size_t& i)
 {
-  // Handle MSVC slash and clang-cl passthrough options
-  auto arg = args[i];
-  if (arg.starts_with('/')) {
-    arg[0] = '-';
-  }
-  if (arg.starts_with("-clang:")) {
-    arg = arg.substr(7);
-  }
-
+  const auto arg = without_clang_cl_prefix(args[i]);
   if (arg == option) {
     if (i + 1 < args.size()) {
       ++i;
-      return {option, arg};
+      return {option, without_clang_cl_prefix(args[i])};
     } else {
       return {std::nullopt, std::nullopt};
     }
@@ -2101,7 +2105,7 @@ hash_argument(const Context& ctx,
     return {};
   }
 
-  const auto arg = make_dash_option(ctx.config, args[i]);
+  const auto arg = without_clang_cl_prefix(args[i]);
 
   // -L doesn't affect compilation (except for clang).
   if (i < args.size() - 1 && arg == "-L" && !is_clang) {
@@ -2229,7 +2233,7 @@ hash_argument(const Context& ctx,
   if (direct_mode) {
     std::optional<std::string_view> path;
     if (compopt_takes_path(arg) && i + 1 < args.size()) {
-      path = args[i + 1];
+      path = without_clang_cl_prefix(args[i + 1]);
     } else {
       auto p = compopt_prefix_takes_path(arg);
       if (p) {
@@ -2242,16 +2246,20 @@ hash_argument(const Context& ctx,
     }
   }
 
-  if (ctx.args_info.generating_dependencies) {
+  // For MSVC-style compilers, only options forwarded by clang-cl's /clang:
+  // can be dependency options, -MT is the static runtime library option.
+  if (ctx.args_info.generating_dependencies
+      && (!ctx.config.is_compiler_group_msvc()
+          || args[i].starts_with("-clang:"))) {
     if (arg.starts_with("-Wp,")) {
       // Skip the dependency filename since it doesn't impact the output.
       if (arg.starts_with("-Wp,-MD,")
           && arg.find(',', 8) == std::string::npos) {
-        hash.hash(args[i].data(), 8);
+        hash.hash(arg.data(), 8);
         return {};
       } else if (arg.starts_with("-Wp,-MMD,")
                  && arg.find(',', 9) == std::string::npos) {
-        hash.hash(args[i].data(), 9);
+        hash.hash(arg.data(), 9);
         return {};
       }
     } else {
@@ -2274,7 +2282,7 @@ hash_argument(const Context& ctx,
 
   if (arg.starts_with("-specs=") || arg == "-specs"
       || arg.starts_with("--specs=") || arg == "--specs") {
-    auto [_option, specs] = util::split_once_into_views(arg, '=');
+    auto specs = util::split_once_into_views(arg, '=').second;
     if (!specs) {
       if (i + 1 >= args.size()) {
         LOG("Missing argument for \"{}\"", args[i]);
@@ -2324,13 +2332,13 @@ hash_argument(const Context& ctx,
     // Since there doesn't seem to be an easy way to query which directory is
     // used we only support names with a slash for now.
 
-    auto [_option, config] = util::split_once_into_views(arg, '=');
+    auto config = util::split_once_into_views(arg, '=').second;
     if (!config) {
       if (i + 1 >= args.size()) {
         LOG("Missing argument for \"{}\"", args[i]);
         return tl::unexpected(Statistic::bad_compiler_arguments);
       }
-      config = args[i + 1];
+      config = without_clang_cl_prefix(args[i + 1]);
       i++;
     }
 
@@ -2362,12 +2370,13 @@ hash_argument(const Context& ctx,
   }
 
   if (arg == "-Xclang" && i + 3 < args.size()
-      && make_dash_option(ctx.config, args[i + 1]) == "-load"
-      && make_dash_option(ctx.config, args[i + 2]) == "-Xclang") {
-    DirEntry dir_entry(args[i + 3], DirEntry::LogOnError::yes);
+      && without_clang_cl_prefix(args[i + 1]) == "-load"
+      && without_clang_cl_prefix(args[i + 2]) == "-Xclang") {
+    const std::string plugin(without_clang_cl_prefix(args[i + 3]));
+    DirEntry dir_entry(plugin, DirEntry::LogOnError::yes);
     if (dir_entry.is_regular_file()) {
       hash.hash_delimiter("plugin");
-      TRY(hash_compiler(ctx, hash, dir_entry, args[i + 3], false));
+      TRY(hash_compiler(ctx, hash, dir_entry, plugin, false));
       i += 3;
       return {};
     }
@@ -2387,7 +2396,7 @@ hash_argument(const Context& ctx,
   static constexpr auto warning_suppression_mappings =
     "--warning-suppression-mappings="sv;
   if (arg.starts_with(warning_suppression_mappings)) {
-    auto [_option, path] = util::split_once_into_views(arg, '=');
+    const auto path = util::split_once_into_views(arg, '=').second;
     hash.hash_delimiter(warning_suppression_mappings);
     if (auto r = hash.hash_file(*path); !r) {
       LOG("Failed to hash {}: {}", *path, r.error());

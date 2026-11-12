@@ -96,6 +96,11 @@ public:
   bool rewrite_FI_args = false;
   bool output_sarif_is_directory = false;
 
+  // <arg> of clang-cl /clang:<arg> options in command line order.
+  util::Args clang_cl_forwarded_args;
+  // Prepended to every argument the add_*_arg methods add.
+  std::string_view arg_prefix;
+
   std::string explicit_language;             // As specified with -x.
   std::string input_charset_option;          // -finput-charset=...
   std::string last_seen_msvc_z_debug_option; // /Z7, /Zi or /ZI
@@ -123,37 +128,37 @@ public:
   void
   add_common_arg(T&& arg)
   {
-    m_preprocessor_args.push_back(std::forward<T>(arg));
-    m_compiler_args.push_back(std::forward<T>(arg));
+    push_back(m_preprocessor_args, arg);
+    push_back(m_compiler_args, std::forward<T>(arg));
   }
 
   template<typename T>
   void
   add_compiler_only_arg(T&& arg)
   {
-    m_compiler_args.push_back(std::forward<T>(arg));
-    m_extra_args_to_hash.push_back(std::forward<T>(arg));
+    push_back(m_compiler_args, arg);
+    push_back(m_extra_args_to_hash, std::forward<T>(arg));
   }
 
   template<typename T>
   void
   add_compiler_only_arg_no_hash(T&& arg)
   {
-    m_compiler_args.push_back(std::forward<T>(arg));
+    push_back(m_compiler_args, std::forward<T>(arg));
   }
 
   template<typename T>
   void
   add_extra_args_to_hash(T&& args)
   {
-    m_extra_args_to_hash.push_back(std::forward<T>(args));
+    push_back(m_extra_args_to_hash, std::forward<T>(args));
   }
 
   template<typename T>
   void
   add_native_arg(T&& arg)
   {
-    m_native_args.push_back(std::forward<T>(arg));
+    push_back(m_native_args, std::forward<T>(arg));
   }
 
   util::Args&
@@ -181,6 +186,16 @@ public:
   }
 
 private:
+  template<typename T>
+  void
+  push_back(util::Args& args, T&& arg)
+  {
+    args.push_back(std::forward<T>(arg));
+    if (!arg_prefix.empty()) {
+      args[args.size() - 1].insert(0, arg_prefix);
+    }
+  }
+
   util::Args m_preprocessor_args;
   util::Args m_compiler_args;
   util::Args m_extra_args_to_hash;
@@ -498,6 +513,18 @@ process_msvc_experimental_log_option(const Context& ctx,
   return Statistic::none;
 }
 
+std::string
+make_dash_option(const Config& config, const std::string& arg)
+{
+  std::string new_arg = arg;
+  if (config.is_compiler_group_msvc() && arg.starts_with("/")) {
+    // MSVC understands both /option and -option, so convert all /option to
+    // -option to simplify our handling.
+    new_arg[0] = '-';
+  }
+  return new_arg;
+}
+
 bool
 is_msvc_z_debug_option(std::string_view arg)
 {
@@ -588,13 +615,16 @@ process_option_arg(const Context& ctx,
   // state.*_args since it's potentially != args[i].
   std::string arg = make_dash_option(ctx.config, args[i]);
 
-  const auto is_clang_cl_passthru =
-    config.compiler_type() == CompilerType::clang_cl
-    && (args[i].starts_with("-clang:") || args[i].starts_with("/clang:"));
-
   // Exit early if we notice a non-option argument right away.
   if (arg.empty() || (arg[0] != '-' && arg[0] != '@')) {
     return std::nullopt;
+  }
+
+  if (ctx.config.compiler_type() == CompilerType::clang_cl
+      && arg.starts_with("-clang:")) {
+    // Processed last, see process_clang_cl_forwarded_args.
+    state.clang_cl_forwarded_args.push_back(arg.substr(7));
+    return Statistic::none;
   }
 
   if (arg == "-ivfsoverlay"
@@ -1055,7 +1085,7 @@ process_option_arg(const Context& ctx,
     return Statistic::none;
   }
 
-  if (config.is_compiler_group_msvc() && !is_clang_cl_passthru
+  if (config.is_compiler_group_msvc()
       && (arg.starts_with("-MP") || arg == "-FS")) {
     state.add_compiler_only_arg_no_hash(args[i]);
     return Statistic::none;
@@ -1063,7 +1093,7 @@ process_option_arg(const Context& ctx,
 
   // These options require special handling, because they behave differently
   // with gcc -E, when the output file is not specified.
-  if ((!config.is_compiler_group_msvc() || is_clang_cl_passthru)
+  if (!config.is_compiler_group_msvc()
       && (arg == "-MD"
           || arg == "-MMD"
           // nvcc -MD:
@@ -1102,19 +1132,15 @@ process_option_arg(const Context& ctx,
     }
     // Keep the format of the args the same.
     if (separate_argument) {
-      // Because `i` was incremented, and `args[i - 1]` could possibly start
-      // with "-clang:".
-      state.add_compiler_only_arg(args[i - 1]);
+      state.add_compiler_only_arg("-MF");
       state.add_compiler_only_arg(args_info.output_dep);
     } else {
-      state.add_compiler_only_arg(FMT("{}-MF{}",
-                                      is_clang_cl_passthru ? "-clang:" : "",
-                                      args_info.output_dep));
+      state.add_compiler_only_arg(FMT("-MF{}", args_info.output_dep));
     }
     return Statistic::none;
   }
 
-  if ((!config.is_compiler_group_msvc() || is_clang_cl_passthru)
+  if (!config.is_compiler_group_msvc()
       && (arg.starts_with("-MQ")
           || arg.starts_with("-MT")
           // nvcc -MT:
@@ -1137,8 +1163,7 @@ process_option_arg(const Context& ctx,
       const std::string_view arg_view(arg);
       const auto arg_opt = arg_view.substr(0, 3);
       dep_target = arg_view.substr(3);
-      state.add_compiler_only_arg(FMT(
-        "{}{}{}", is_clang_cl_passthru ? "-clang:" : "", arg_opt, dep_target));
+      state.add_compiler_only_arg(FMT("{}{}", arg_opt, dep_target));
     }
 
     if (args_info.dependency_target) {
@@ -1324,8 +1349,7 @@ process_option_arg(const Context& ctx,
   if (arg.starts_with("--sysroot=")) {
     auto path = std::string_view(arg).substr(10);
     auto relpath = core::make_relative_path(ctx, path);
-    state.add_common_arg(
-      FMT("{}--sysroot={}", is_clang_cl_passthru ? "-clang:" : "", relpath));
+    state.add_common_arg(FMT("--sysroot={}", relpath));
     return Statistic::none;
   }
 
@@ -1416,7 +1440,7 @@ process_option_arg(const Context& ctx,
 
   // Input charset needs to be handled specially.
   if (arg.starts_with("-finput-charset=")) {
-    state.input_charset_option = args[i];
+    state.input_charset_option = FMT("{}{}", state.arg_prefix, args[i]);
     return Statistic::none;
   }
 
@@ -1764,6 +1788,40 @@ process_arg(const Context& ctx,
   return Statistic::none;
 }
 
+// clang-cl passes the <arg>s of all /clang:<arg> options to the clang driver as
+// one list after all other options, so an option's separate value is the next
+// /clang:<arg>. Process them last as clang options and prefix everything added
+// to the command lines with "-clang:".
+std::optional<Statistic>
+process_clang_cl_forwarded_args(Context& ctx,
+                                ArgsInfo& args_info,
+                                ArgumentProcessingState& state)
+{
+  util::Args args = state.clang_cl_forwarded_args;
+  std::optional<Statistic> error;
+  ctx.config.set_compiler_type(CompilerType::clang);
+  state.arg_prefix = "-clang:";
+  for (size_t i = 0; i < args.size() && !error; ++i) {
+    const auto statistic =
+      process_option_arg(ctx, args_info, ctx.config, args, i, state);
+    if (!statistic) {
+      // Like process_arg: a value that isn't a file is assumed to be an option,
+      // while another input file is unsupported.
+      if (DirEntry(args[i]).is_regular_file()) {
+        LOG("Input file -clang:{} is unsupported", args[i]);
+        error = Statistic::unsupported_compiler_option;
+      } else {
+        state.add_common_arg(args[i]);
+      }
+    } else if (*statistic != Statistic::none) {
+      error = statistic;
+    }
+  }
+  state.arg_prefix = {};
+  ctx.config.set_compiler_type(CompilerType::clang_cl);
+  return error;
+}
+
 const char*
 get_default_object_file_extension(const Config& config)
 {
@@ -1777,25 +1835,6 @@ get_default_pch_file_extension(const Config& config)
 }
 
 } // namespace
-
-std::string
-make_dash_option(const Config& config, const std::string& arg)
-{
-  std::string new_arg = arg;
-  if (config.is_compiler_group_msvc() && new_arg.starts_with("/")) {
-    // MSVC understands both /option and -option, so convert all /option to
-    // -option to simplify our handling.
-    new_arg[0] = '-';
-  }
-  if (config.compiler_type() == CompilerType::clang_cl
-      && new_arg.starts_with("-clang:")) {
-    // Strip the "-clang:" so that the option is detected as a Clang option.
-    // This does mean that any ArgumentProcessingState::add_*_arg() method
-    // needs to be passed the original argument(s) from the util::Args object.
-    new_arg = new_arg.substr(7);
-  }
-  return new_arg;
-}
 
 tl::expected<ProcessArgsResult, core::Statistic>
 process_args(Context& ctx)
@@ -1834,6 +1873,10 @@ process_args(Context& ctx)
     if (!restart) {
       break;
     }
+  }
+
+  if (!argument_error && !state.clang_cl_forwarded_args.empty()) {
+    argument_error = process_clang_cl_forwarded_args(ctx, args_info, state);
   }
 
   std::reverse(args_info.debug_prefix_maps.begin(),

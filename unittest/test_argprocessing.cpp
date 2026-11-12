@@ -102,42 +102,19 @@ TEST_CASE("dash_M_should_be_unsupported")
 TEST_CASE("dependency_args_to_compiler")
 {
   TestContext test_context;
+  const std::string dep_args =
+    "-MD -MMD -MP -MF foo.d -MT mt1 -MT mt2 -MQ mq1 -MQ mq2 -Wp,-MP"
+    " -Wp,-MT,wpmt -Wp,-MQ,wpmq -Wp,-MF,wpf";
   Context ctx;
+  ctx.orig_args = Args::from_string("cc " + dep_args + " -c foo.c -o foo.o");
   REQUIRE(util::write_file("foo.c", ""));
 
-  SUBCASE("non_clang_cl")
-  {
-    const std::string dep_args =
-      "-MD -MMD -MP -MF foo.d -MT mt1 -MT mt2 -MQ mq1 -MQ mq2 -Wp,-MP"
-      " -Wp,-MT,wpmt -Wp,-MQ,wpmq -Wp,-MF,wpf";
-    ctx.orig_args = Args::from_string("cc " + dep_args + " -c foo.c -o foo.o");
-    const auto result = process_args(ctx);
+  const auto result = process_args(ctx);
 
-    CHECK(result);
-    CHECK(result->preprocessor_args.to_string() == "cc");
-    CHECK(result->extra_args_to_hash.to_string() == dep_args);
-    CHECK(result->compiler_args.to_string() == "cc " + dep_args + " -c");
-  }
-
-  SUBCASE("clang_cl")
-  {
-    const std::string dep_args =
-      "-clang:-MD -clang:-MMD -clang:-MP -clang:-MF foo.d -clang:-MT mt1 "
-      "-clang:-MT mt2 -clang:-MQ mq1 -clang:-MQ mq2 -clang:-Wp,-MP "
-      "-clang:-Wp,-MT,wpmt -clang:-Wp,-MQ,wpmq -clang:-Wp,-MF,wpf";
-    ctx.orig_args =
-      Args::from_string("clang-cl.exe " + dep_args + " -c foo.c -o foo.o");
-    ctx.config.set_compiler_type(CompilerType::clang_cl);
-    const auto result = process_args(ctx);
-
-    CHECK(result);
-    CHECK(result->preprocessor_args.to_string() == "clang-cl.exe");
-    CHECK(result->extra_args_to_hash.to_string() == dep_args);
-    // -fcolor-diagnostics is here because it's added by process_args when
-    // the compiler is clang-like.
-    CHECK(result->compiler_args.to_string()
-          == "clang-cl.exe " + dep_args + " -fcolor-diagnostics -c");
-  }
+  CHECK(result);
+  CHECK(result->preprocessor_args.to_string() == "cc");
+  CHECK(result->extra_args_to_hash.to_string() == dep_args);
+  CHECK(result->compiler_args.to_string() == "cc " + dep_args + " -c");
 }
 
 TEST_CASE("cpp_only_args_to_preprocessor_and_compiler")
@@ -1577,6 +1554,146 @@ TEST_CASE("-Xarch_device with -Xarch_x86_64 is too hard")
 
   REQUIRE(!result);
   CHECK(result.error() == Statistic::unsupported_compiler_option);
+}
+
+TEST_CASE("-clang: with an input file is unsupported")
+{
+  TestContext test_context;
+  Context ctx;
+
+  ctx.config.set_compiler_type(CompilerType::clang_cl);
+  REQUIRE(util::write_file("foo.c", ""));
+  REQUIRE(util::write_file("bar.c", ""));
+
+  SUBCASE("-clang:")
+  {
+    ctx.orig_args = Args::from_string("clang-cl -c foo.c -clang:bar.c");
+  }
+
+  SUBCASE("/clang:")
+  {
+    ctx.orig_args = Args::from_string("clang-cl -c foo.c /clang:bar.c");
+  }
+
+  const auto result = process_args(ctx);
+  REQUIRE(!result);
+  CHECK(result.error() == Statistic::unsupported_compiler_option);
+}
+
+TEST_CASE("-clang: options are processed after all other options")
+{
+  TestContext test_context;
+  Context ctx;
+  ctx.config.set_compiler_type(CompilerType::clang_cl);
+  REQUIRE(util::write_file("foo.c", ""));
+
+  SUBCASE("Attached value")
+  {
+    // As emitted by CMake 4.4 with Ninja.
+    ctx.orig_args = Args::from_string(
+      "clang-cl -clang:-std=c++23 -clang:-MD -clang:-MTfoo.obj"
+      " -clang:-MFfoo.d /Fofoo.obj -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(ctx.args_info.generating_dependencies);
+    CHECK(ctx.args_info.output_dep == "foo.d");
+    CHECK(ctx.args_info.dependency_target == "foo.obj");
+    CHECK(result->preprocessor_args.to_string()
+          == "clang-cl -clang:-std=c++23");
+    CHECK(result->extra_args_to_hash.to_string()
+          == "-clang:-MD -clang:-MTfoo.obj -clang:-MFfoo.d");
+    CHECK(result->compiler_args.to_string()
+          == "clang-cl -clang:-std=c++23 -clang:-MD -clang:-MTfoo.obj"
+             " -clang:-MFfoo.d -fcolor-diagnostics -c");
+  }
+
+  SUBCASE("Separate value in the next -clang: option")
+  {
+    ctx.orig_args = Args::from_string(
+      "clang-cl -clang:-MD -clang:-MT -clang:foo.obj -clang:-MF -clang:foo.d"
+      " /Fofoo.obj -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_dep == "foo.d");
+    CHECK(ctx.args_info.dependency_target == "foo.obj");
+    CHECK(result->extra_args_to_hash.to_string()
+          == "-clang:-MD -clang:-MT -clang:foo.obj -clang:-MF -clang:foo.d");
+    CHECK(result->compiler_args.to_string()
+          == "clang-cl -clang:-MD -clang:-MT -clang:foo.obj -clang:-MF"
+             " -clang:foo.d -fcolor-diagnostics -c");
+  }
+
+  SUBCASE("Value that isn't a file")
+  {
+    ctx.orig_args = Args::from_string(
+      "clang-cl /clang:-target /clang:x86_64-pc-windows-msvc -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(result->preprocessor_args.to_string()
+          == "clang-cl -clang:-target -clang:x86_64-pc-windows-msvc");
+  }
+
+  SUBCASE("Input charset")
+  {
+    ctx.orig_args =
+      Args::from_string("clang-cl /clang:-finput-charset=UTF-8 -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(result->preprocessor_args.to_string()
+          == "clang-cl -clang:-finput-charset=UTF-8");
+  }
+
+  SUBCASE("Slash spelling")
+  {
+    ctx.orig_args = Args::from_string(
+      "clang-cl /clang:-MD /clang:-MF /clang:foo.d /Fofoo.obj -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(ctx.args_info.output_dep == "foo.d");
+    CHECK(result->extra_args_to_hash.to_string()
+          == "-clang:-MD -clang:-MF -clang:foo.d");
+  }
+
+  SUBCASE("Missing argument")
+  {
+    ctx.orig_args = Args::from_string("clang-cl -c foo.c -clang:-MF");
+    const auto result = process_args(ctx);
+    REQUIRE(!result);
+    CHECK(result.error() == Statistic::bad_compiler_arguments);
+  }
+
+  SUBCASE("Command line order")
+  {
+    ctx.orig_args =
+      Args::from_string("clang-cl -clang:-DX=2 -c foo.c -DX=1 /Fofoo.obj");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(result->preprocessor_args.to_string()
+          == "clang-cl -DX=1 -clang:-DX=2");
+  }
+
+  SUBCASE("Generic clang driver options")
+  {
+    ctx.orig_args = Args::from_string(
+      "clang-cl /clang:-fno-math-errno /clang:-ffp-contract=off -c foo.c");
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(result->preprocessor_args.to_string()
+          == "clang-cl -clang:-fno-math-errno -clang:-ffp-contract=off");
+  }
+
+  SUBCASE("Rewritten options keep the prefix")
+  {
+    ctx.config.set_base_dir(get_root());
+    ctx.orig_args = Args::from_string(
+      FMT("clang-cl -clang:-isystem{0}/foo -clang:-isystem -clang:{0}/bar"
+          " -c foo.c",
+          ctx.actual_cwd));
+    const auto result = process_args(ctx);
+    REQUIRE(result);
+    CHECK(result->preprocessor_args.to_string()
+          == "clang-cl -clang:-isystemfoo -clang:-isystem -clang:bar");
+  }
 }
 
 TEST_CASE("-fprebuilt-module-path= hashes the module files in the directory")

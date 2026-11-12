@@ -18,7 +18,6 @@
 
 #pragma once
 
-#include <ccache/config.hpp>
 #include <ccache/core/statistic.hpp>
 #include <ccache/util/args.hpp>
 
@@ -58,5 +57,3 @@ bool is_precompiled_header(const std::filesystem::path& path);
 
 bool option_should_be_ignored(const std::string& arg,
                               const std::vector<std::string>& patterns);
-
-std::string make_dash_option(const Config& config, const std::string& arg);
